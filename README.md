@@ -1,15 +1,18 @@
 # ExampleFargateRedis
 Example AWS resources for Fargate + Elasticache Redis.
 
+This cloudformation template will create:
+* An ECS cluster that supports fargate and fargate spot.
+* An ECR repo.
+* A VPC, subnets, a (free!) internet gateway, an SSH ingress you can use for testing.
+* A fargate task definition with a basic role, an example access policy, cloudwatch logging, and is tied to the ECR repo.
+* An Elasticache Redis cluster. Note: deploying this template creates a running cluster that charges you.
+
 ## Prerequisites
 
 ### SAM CLI
 
 This package assumes you have the SAM CLI installed on your developer instance. See: https://github.com/awsdocs/aws-sam-developer-guide/blob/master/doc_source/serverless-sam-cli-install-linux.md
-
-### Docker (For testing and development)
-
-If you want to test and develop, you're going to want docker to be installed so you can run the local lambda docker container. This will allow you to run sam local commands. See: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install-linux.html#serverless-sam-cli-install-linux-docker
 
 ## Usage
 
