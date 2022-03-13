@@ -1,0 +1,310 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Example Fargate + Elasticache cloudformation template.
+
+Globals:
+  Function:
+    #Documentation and other DeploymentPreference Types can be found here: https://github.com/awslabs/serverless-application-model/blob/master/docs/safe_lambda_deployments.rst
+    AutoPublishAlias: live
+    DeploymentPreference:
+      Type: AllAtOnce
+
+Parameters:
+  AttachLambdaFunctionToVPC: { Type: String, Default: 'false', AllowedValues: ['true', 'false']}
+  Stage: {Type: String, Default: 'prod'}
+  ServiceName: {Type: String, Default: 'ExampleFargateRedis'}
+
+Conditions:
+  IsProd:
+    Fn::Equals:
+      - Ref: Stage
+      - prod
+
+#CIDR subnet mappings of available IP addresses in the VPC.
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: '10.0.0.0/16'
+    PublicOne:
+      CIDR: '10.0.0.0/24'
+    PublicTwo:
+      CIDR: '10.0.1.0/24'
+
+Resources:
+  ######################################################
+  #                 Fargate/VPC Stuff                  #
+  ######################################################
+
+  #Fargate VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']
+
+  #Networking resources and internet gateway for VPC.
+  #Internet gateway is required to give fargate containers in awsvpc mode 
+  #access to the internet. It's free, and beats paying $30/mo to do the same 
+  #thing for lambda functions in a VPC.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref 'VPC'
+      InternetGatewayId: !Ref 'InternetGateway'
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref 'PublicRouteTable'
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref 'InternetGateway'
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetTwo
+      RouteTableId: !Ref PublicRouteTable
+
+  #Two public subnets, where containers can have public IP addresses
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+         Fn::Select:
+         - 0
+         - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: {Ref: VPC}
+      CidrBlock: !FindInMap ['SubnetConfig', 'PublicOne', 'CIDR']
+      MapPublicIpOnLaunch: true
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+         Fn::Select:
+         - 1
+         - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: {Ref: VPC}
+      CidrBlock: !FindInMap ['SubnetConfig', 'PublicTwo', 'CIDR']
+      MapPublicIpOnLaunch: true
+
+  #Security group for fargate.
+  FargateContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the Fargate containers
+      VpcId: {Ref: VPC}
+  
+  #Fargate group ingress via internet gateway, used for testing and debugging.
+  #Locked down currently to my IP.
+  #This way, I can spin up EC2 instances with internet access inside of the 
+  #same VPC for fargate to be able to check on stuff, like testing Elasticache.
+  #Comment this resource out if you don't intend to do this.
+  FargateIngressTesting:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Testing for fargate containers.
+      GroupId: {Ref: FargateContainerSecurityGroup}
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      #Put your IP here.
+      CidrIp: 69.69.69.69/32
+
+  #ECS Cluster
+  #If you only want regular fargate, remove fargate spot capabilities.
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: ExampleFargateRedis
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+        - CapacityProvider: FARGATE_SPOT
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  #General purpose role needed by ECS to be able to spin up tasks.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ServiceName, ExecutionRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  ######################################################
+  #              Elasticache/Redis stuff               #
+  ######################################################
+
+  #Generic elasticache cluster.
+  Redis:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: GenericRedis
+      Engine: redis
+      CacheNodeType: cache.t4g.small
+      NumCacheNodes: 1
+      Port: 6379
+      CacheSubnetGroupName: !Ref 'RedisSubnetGroup'
+      PreferredMaintenanceWindow: 'sat:01:00-sat:03:00'
+      VpcSecurityGroupIds:
+        - !GetAtt 'RedisSecurityGroup.GroupId'
+
+  #Subnet group to control where the Redis gets placed
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Group of subnets to place Redis into
+      SubnetIds:
+        - {Ref: PublicSubnetOne}
+        - {Ref: PublicSubnetTwo}
+
+  #Security group to add Redis cluster to the VPC, and allow
+  #fargate containers to talk to Redis.
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Redis Security Group"
+      VpcId: {Ref: VPC}
+  
+  #Task group ingress.
+  #Default Redis ports.
+  RedisIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from Fargate containers
+      GroupId: {Ref: RedisSecurityGroup}
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: {Ref: FargateContainerSecurityGroup}
+
+  ######################################################
+  #                 Fargate task stuff                 #
+  ######################################################
+
+  #ECR repo for worker docker images.
+  ExampleFargateRedisRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: 'example/fargate_redis_example'
+
+  #Log group delta.
+  LogGroupTasks:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/ecs/, !Ref ServiceName, Task]]
+      RetentionInDays: 30
+
+  #Task definition.
+  #Just a basic example task, doesn't do anything except hello world.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    # Makes sure the log group is created before it is used.
+    DependsOn: LogGroupTasks
+    Properties:
+      Family: !Join ['', [!Ref ServiceName, TaskDef]]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 2GB
+      ExecutionRoleArn: { 'Fn::GetAtt' : ExecutionRole.Arn}
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: !Join ['', [!Ref ServiceName, Task]]
+          Image: { 'Fn::Join' : [ ':', [ { 'Fn::GetAtt' : ExampleFargateRedisRepository.RepositoryUri}, 'latest']]}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroupTasks
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: 'EXAMPLE_ENVIRONMENT_VARIABLE'
+              Value: 'hello_world'
+
+  #Permissions for the tasks.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ServiceName, TaskRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        #Define task-specific AWS policies here. this example gives you DDB full access
+        #to all tables in your account.
+        #Dynamodb access to read and write to multiple tables.
+        - PolicyName: !Join ['', [!Ref ServiceName, TaskRole, DDBFull]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                Resource: {'Fn::Sub': 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:*'}
+
+Outputs:
+  StackArn:
+    Description: "Use this as the stack_arn in your cloud_formation_deployment_stack override."
+    Value: {Ref: 'AWS::StackId'}
+  ExampleFargateRedisPublicSubnetOne:
+    Description: "Public ECS subnet one."
+    Value: {Ref: PublicSubnetOne}
+    Export: {Name: {'Fn::Sub': '${AWS::StackName}-PublicSubnetOne'}}
+  ExampleFargateRedisPublicSubnetTwo:
+    Description: "Public ECS subnet one."
+    Value: {Ref: PublicSubnetTwo}
+    Export: {Name: {'Fn::Sub': '${AWS::StackName}-PublicSubnetTwo'}}
+  ExampleFargateRedisVPC:
+    Description: "VPC for ECS."
+    Value: {Ref: VPC}
+    Export: {Name: {'Fn::Sub': '${AWS::StackName}-VPC'}}
+  ExampleFargateRedisFargateContainerSecurityGroup:
+    Description: "Security group for fargate containers."
+    Value: {Ref: FargateContainerSecurityGroup}
+    Export: {Name: {'Fn::Sub': '${AWS::StackName}-FargateContainerSecurityGroup'}}
+  ExampleFargateRedisECSTaskExecutionRoleArn:
+    Description: "Role ARN for all ECS tasks executed in the cluster."
+    Value: { 'Fn::GetAtt' : ExecutionRole.Arn}
+    Export: {Name: {'Fn::Sub': '${AWS::StackName}-ECSTaskExecutionRoleArn'}}
+  ExampleFargateRedisECSCluster:
+    Description: "ECS Cluster name."
+    Value: {Ref: ECSCluster}
+    Export: {Name: {'Fn::Sub': '${AWS::StackName}-ECSCluster'}}
+  ExampleFargateRedisECSClusterArn:
+    Description: "ECS Cluster ARN."
+    Value: { 'Fn::GetAtt' : ECSCluster.Arn}
+    Export: {Name: {'Fn::Sub': '${AWS::StackName}-ECSClusterArn'}}
+  RedisSecurityGroupId:
+    Description: "Redis cluster security group ID."
+    Value: !GetAtt 'RedisSecurityGroup.GroupId'
+    Export: {Name: {'Fn::Sub': '${AWS::StackName}-RedisSecurityGroupId'}}
+  RedisSubnetGroupName:
+    Description: "Redis cluster subnet group name."
+    Value: {Ref: RedisSubnetGroup}
+    Export: {Name: {'Fn::Sub': '${AWS::StackName}-RedisSubnetGroupName'}}
